@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#0E1A16</color>
+    <string name="app_name">Cadastro OCR</string>
+    <style name="Theme.CadastroOcr" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#0E1A16</item>
+        <item name="android:windowBackground">#0E1A16</item>
+    </style>
+</resources>

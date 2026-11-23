@@ -1,0 +1,7 @@
+name = "cadastro-ocr-backend"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# As chaves de verdade (GEMINI_API_KEY, APP_SHARED_SECRET) NÃO ficam aqui —
+# elas são configuradas como "secrets" via linha de comando (ver README.md),
+# então nunca aparecem em nenhum arquivo, nem neste.

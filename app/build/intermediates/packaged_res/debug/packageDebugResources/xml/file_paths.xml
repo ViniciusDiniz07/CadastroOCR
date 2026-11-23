@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Pasta de cache interna: as fotos de documentos ficam SOMENTE aqui,
+         nunca em armazenamento público, e são apagadas após o OCR (ver DocumentImageStore.kt) -->
+    <cache-path name="documentos_temp" path="documentos/" />
+</paths>

@@ -1,0 +1,5 @@
+com.cadastroocr.app.test.app-core-1.6.1-0 C:\Users\wwwvi\.gradle\caches\transforms-4\499e98d50cae43f87b6144a5eaccaa2f\transformed\core-1.6.1\res
+com.cadastroocr.app.test.app-androidTest-1 C:\Users\wwwvi\OneDrive\cod\progetos\luciano\CadastroOCR_5-ia\CadastroOCR\app\build\generated\res\resValues\androidTest\debug
+com.cadastroocr.app.test.app-mergeDebugAndroidTestResources-2 C:\Users\wwwvi\OneDrive\cod\progetos\luciano\CadastroOCR_5-ia\CadastroOCR\app\build\intermediates\incremental\debugAndroidTest\mergeDebugAndroidTestResources\merged.dir
+com.cadastroocr.app.test.app-mergeDebugAndroidTestResources-3 C:\Users\wwwvi\OneDrive\cod\progetos\luciano\CadastroOCR_5-ia\CadastroOCR\app\build\intermediates\incremental\debugAndroidTest\mergeDebugAndroidTestResources\stripped.dir
+com.cadastroocr.app.test.app-debugAndroidTest-4 C:\Users\wwwvi\OneDrive\cod\progetos\luciano\CadastroOCR_5-ia\CadastroOCR\app\build\intermediates\merged_res\debugAndroidTest\mergeDebugAndroidTestResources
