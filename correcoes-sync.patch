@@ -1,0 +1,1231 @@
+diff --git a/app/src/main/java/com/cadastroocr/app/MainActivity.kt b/app/src/main/java/com/cadastroocr/app/MainActivity.kt
+index 5343cb6..ec2fc51 100644
+--- a/app/src/main/java/com/cadastroocr/app/MainActivity.kt
++++ b/app/src/main/java/com/cadastroocr/app/MainActivity.kt
+@@ -8,10 +8,14 @@ import androidx.activity.compose.setContent
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.activity.viewModels
+ import androidx.core.content.ContextCompat
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.lifecycleScope
++import androidx.lifecycle.repeatOnLifecycle
+ import com.cadastroocr.app.ocr.DocumentImageStore
+ import com.cadastroocr.app.ui.navigation.AppNavGraph
+ import com.cadastroocr.app.ui.theme.CadastroOcrTheme
+ import com.cadastroocr.app.viewmodel.ClienteViewModel
++import kotlinx.coroutines.launch
+ 
+ class MainActivity : ComponentActivity() {
+ 
+@@ -36,6 +40,15 @@ class MainActivity : ComponentActivity() {
+             solicitarPermissaoCamera.launch(Manifest.permission.CAMERA)
+         }
+ 
++        // Sincroniza ao abrir o app e continua a cada ~20 s enquanto ele estiver visível,
++        // para que cadastros feitos em outro aparelho apareçam sozinhos.
++        val syncManager = (application as CadastroOcrApp).syncManager
++        lifecycleScope.launch {
++            repeatOnLifecycle(Lifecycle.State.STARTED) {
++                syncManager.executarEnquantoAtivo()
++            }
++        }
++
+         setContent {
+             CadastroOcrTheme {
+                 AppNavGraph(viewModel = viewModel)
+diff --git a/app/src/main/java/com/cadastroocr/app/auth/AuthManager.kt b/app/src/main/java/com/cadastroocr/app/auth/AuthManager.kt
+index b658f8f..15cac85 100644
+--- a/app/src/main/java/com/cadastroocr/app/auth/AuthManager.kt
++++ b/app/src/main/java/com/cadastroocr/app/auth/AuthManager.kt
+@@ -2,9 +2,13 @@ package com.cadastroocr.app.auth
+ 
+ import android.content.Context
+ import android.content.SharedPreferences
++import com.cadastroocr.app.sync.ApiHttpException
++import com.cadastroocr.app.sync.Sessao
+ import com.cadastroocr.app.sync.SupabaseApiService
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
+ 
+ sealed class EstadoAuth {
+     data object Desconectado : EstadoAuth()
+@@ -12,9 +16,13 @@ sealed class EstadoAuth {
+     data object ModoOffline : EstadoAuth()
+ }
+ 
++/** Sessão encerrada de verdade (refresh token recusado pelo servidor): é preciso entrar de novo. */
++class SessaoExpiradaException : Exception("Sessão expirada. Entre novamente.")
++
+ class AuthManager(context: Context, private val apiService: SupabaseApiService) {
+ 
+     private val prefs: SharedPreferences = context.getSharedPreferences("cadastro_ocr_auth", Context.MODE_PRIVATE)
++    private val renovacaoMutex = Mutex()
+ 
+     private val _estadoAuth = MutableStateFlow<EstadoAuth>(obterEstadoInicial())
+     val estadoAuth: StateFlow<EstadoAuth> = _estadoAuth
+@@ -38,6 +46,56 @@ class AuthManager(context: Context, private val apiService: SupabaseApiService)
+     fun obterToken(): String? = prefs.getString(KEY_TOKEN, null)
+     fun obterEmail(): String? = prefs.getString(KEY_EMAIL, null)
+ 
++    /**
++     * Devolve um access token válido, renovando-o com o refresh token quando estiver perto de expirar.
++     *
++     * - Falha de REDE ao renovar: mantém a sessão (o usuário NÃO é deslogado); a sincronização tenta de novo depois.
++     * - Refresh token recusado pelo servidor (400/401/403): aí sim a sessão acabou -> [SessaoExpiradaException].
++     *
++     * [tokenRecusado]: informe o token que acabou de levar 401 para forçar a renovação
++     * (se outra chamada já renovou nesse meio tempo, o token novo é reaproveitado).
++     */
++    suspend fun obterTokenValido(tokenRecusado: String? = null): Result<String> {
++        val atualRapido = prefs.getString(KEY_TOKEN, null)
++        if (atualRapido.isNullOrBlank()) return Result.failure(SessaoExpiradaException())
++        if (tokenRecusado == null && !tokenPrecisaRenovar()) return Result.success(atualRapido)
++
++        return renovacaoMutex.withLock {
++            val atual = prefs.getString(KEY_TOKEN, null)
++            if (atual.isNullOrBlank()) return@withLock Result.failure(SessaoExpiradaException())
++
++            // Outra corrotina já renovou enquanto esperávamos o lock.
++            if (tokenRecusado != null && atual != tokenRecusado) return@withLock Result.success(atual)
++            if (tokenRecusado == null && !tokenPrecisaRenovar()) return@withLock Result.success(atual)
++
++            val refresh = prefs.getString(KEY_REFRESH, null)
++            if (refresh.isNullOrBlank()) {
++                encerrarSessaoExpirada()
++                return@withLock Result.failure(SessaoExpiradaException())
++            }
++
++            val resultado = apiService.renovarToken(refresh)
++            val sessao = resultado.getOrNull()
++            if (sessao != null) {
++                salvarSessao(sessao)
++                Result.success(sessao.accessToken)
++            } else {
++                val erro = resultado.exceptionOrNull()
++                if (erro is ApiHttpException && erro.codigo in CODIGOS_SESSAO_RECUSADA) {
++                    encerrarSessaoExpirada()
++                    Result.failure(SessaoExpiradaException())
++                } else {
++                    Result.failure(erro ?: Exception("Falha ao renovar a sessão"))
++                }
++            }
++        }
++    }
++
++    private fun tokenPrecisaRenovar(): Boolean {
++        val expiraEm = prefs.getLong(KEY_EXPIRA_EM, 0L)
++        return System.currentTimeMillis() >= expiraEm - MARGEM_RENOVACAO_MS
++    }
++
+     suspend fun login(email: String, senha: String): Result<Unit> {
+         if (!AuthConfig.configurado()) {
+             // Se ainda não configurou credenciais na nuvem, permite entrar em modo local/offline
+@@ -46,10 +104,10 @@ class AuthManager(context: Context, private val apiService: SupabaseApiService)
+         }
+ 
+         val resultado = apiService.login(email, senha)
+-        return if (resultado.isSuccess) {
+-            val (token, refresh, userEmail) = resultado.getOrThrow()
+-            salvarSessao(token, refresh, userEmail)
+-            _estadoAuth.value = EstadoAuth.Autenticado(userEmail)
++        val sessao = resultado.getOrNull()
++        return if (sessao != null) {
++            salvarSessao(sessao)
++            _estadoAuth.value = EstadoAuth.Autenticado(sessao.email)
+             Result.success(Unit)
+         } else {
+             Result.failure(resultado.exceptionOrNull() ?: Exception("Erro desconhecido"))
+@@ -63,11 +121,11 @@ class AuthManager(context: Context, private val apiService: SupabaseApiService)
+         }
+ 
+         val resultado = apiService.cadastrar(email, senha)
+-        return if (resultado.isSuccess) {
+-            val (token, refresh, userEmail) = resultado.getOrThrow()
+-            if (token.isNotBlank()) {
+-                salvarSessao(token, refresh, userEmail)
+-                _estadoAuth.value = EstadoAuth.Autenticado(userEmail)
++        val sessao = resultado.getOrNull()
++        return if (sessao != null) {
++            if (sessao.accessToken.isNotBlank()) {
++                salvarSessao(sessao)
++                _estadoAuth.value = EstadoAuth.Autenticado(sessao.email)
+             }
+             Result.success(Unit)
+         } else {
+@@ -85,13 +143,21 @@ class AuthManager(context: Context, private val apiService: SupabaseApiService)
+         _estadoAuth.value = EstadoAuth.Desconectado
+     }
+ 
+-    private fun salvarSessao(token: String, refresh: String, email: String) {
+-        prefs.edit()
+-            .putString(KEY_TOKEN, token)
+-            .putString(KEY_REFRESH, refresh)
+-            .putString(KEY_EMAIL, email)
++    private fun encerrarSessaoExpirada() {
++        // Apaga só as credenciais; os clientes continuam salvos no aparelho (Room).
++        prefs.edit().clear().apply()
++        _estadoAuth.value = EstadoAuth.Desconectado
++    }
++
++    private fun salvarSessao(sessao: Sessao) {
++        val editor = prefs.edit()
++            .putString(KEY_TOKEN, sessao.accessToken)
++            .putString(KEY_EMAIL, sessao.email.ifBlank { prefs.getString(KEY_EMAIL, "") ?: "" })
++            .putLong(KEY_EXPIRA_EM, sessao.expiraEmMs)
+             .putBoolean(KEY_MODO_OFFLINE, false)
+-            .apply()
++        // O Supabase rotaciona o refresh token a cada renovação: sempre guardar o mais novo.
++        if (sessao.refreshToken.isNotBlank()) editor.putString(KEY_REFRESH, sessao.refreshToken)
++        editor.apply()
+     }
+ 
+     companion object {
+@@ -99,5 +165,12 @@ class AuthManager(context: Context, private val apiService: SupabaseApiService)
+         private const val KEY_REFRESH = "jwt_refresh_token"
+         private const val KEY_EMAIL = "user_email"
+         private const val KEY_MODO_OFFLINE = "is_offline_mode"
++        private const val KEY_EXPIRA_EM = "jwt_expira_em_ms"
++
++        /** Renova 60 s antes de expirar, para não enviar uma requisição com token vencendo. */
++        private const val MARGEM_RENOVACAO_MS = 60_000L
++
++        /** Respostas do Auth que significam "este refresh token não vale mais". */
++        private val CODIGOS_SESSAO_RECUSADA = setOf(400, 401, 403)
+     }
+ }
+diff --git a/app/src/main/java/com/cadastroocr/app/data/AppDatabase.kt b/app/src/main/java/com/cadastroocr/app/data/AppDatabase.kt
+index aada87b..19c61c8 100644
+--- a/app/src/main/java/com/cadastroocr/app/data/AppDatabase.kt
++++ b/app/src/main/java/com/cadastroocr/app/data/AppDatabase.kt
+@@ -26,11 +26,11 @@ abstract class AppDatabase : RoomDatabase() {
+                     AppDatabase::class.java,
+                     "cadastro_ocr.db"
+                 )
+-                    // O schema ainda está sendo ajustado durante o desenvolvimento.
+-                    // Isso apaga e recria o banco quando a versão muda, em vez de travar
+-                    // com erro. Antes de publicar a versão final para uso real, troque
+-                    // isso por uma Migration de verdade para não perder dados dos clientes.
+-                    .fallbackToDestructiveMigration()
++                    // Só as versões 1 e 2 (anteriores à sincronização, sem dados valiosos na nuvem)
++                    // podem ser recriadas. A partir da versão 3 NUNCA se apaga o banco: ao mudar o
++                    // schema (aumentar `version`), é obrigatório escrever uma Migration com
++                    // `.addMigrations(...)`, senão o Room recusa abrir em vez de apagar os clientes.
++                    .fallbackToDestructiveMigrationFrom(1, 2)
+                     .build()
+                 INSTANCE = instance
+                 instance
+diff --git a/app/src/main/java/com/cadastroocr/app/data/ClienteDao.kt b/app/src/main/java/com/cadastroocr/app/data/ClienteDao.kt
+index d8bae96..3c9733b 100644
+--- a/app/src/main/java/com/cadastroocr/app/data/ClienteDao.kt
++++ b/app/src/main/java/com/cadastroocr/app/data/ClienteDao.kt
+@@ -51,9 +51,34 @@ interface ClienteDao {
+     @Update
+     suspend fun atualizar(cliente: Cliente)
+ 
++    @Query("SELECT COUNT(*) FROM clientes WHERE syncStatus != 'SYNCED'")
++    suspend fun contarPendentes(): Int
++
+     @Query("UPDATE clientes SET syncStatus = :status, lastSyncedAt = :syncedAt WHERE id = :id")
+     suspend fun atualizarStatusSincronizacao(id: Long, status: String, syncedAt: Long = System.currentTimeMillis())
+ 
++    /**
++     * Marca como sincronizado SOMENTE se o registro não mudou desde que foi enviado.
++     * Se o usuário editou o cliente durante o envio, ele continua pendente e vai no próximo ciclo
++     * (antes, a edição nova era marcada como SYNCED e nunca subia).
++     */
++    @Query(
++        """
++        UPDATE clientes SET syncStatus = 'SYNCED', lastSyncedAt = :syncedAt
++        WHERE id = :id AND atualizadoEm = :atualizadoEm AND syncStatus = :statusEnviado
++        """
++    )
++    suspend fun marcarSincronizadoSeInalterado(
++        id: Long,
++        atualizadoEm: Long,
++        statusEnviado: String,
++        syncedAt: Long = System.currentTimeMillis()
++    ): Int
++
++    /** Remove o registro local de uma exclusão já confirmada no servidor (só se continuar marcado como exclusão pendente). */
++    @Query("DELETE FROM clientes WHERE uuid = :uuid AND syncStatus = 'PENDING_DELETE'")
++    suspend fun excluirFisicoSePendenteDelete(uuid: String)
++
+     @Query("UPDATE clientes SET isDeleted = 1, syncStatus = 'PENDING_DELETE', atualizadoEm = :atualizadoEm WHERE id = :id")
+     suspend fun marcarComoExcluido(id: Long, atualizadoEm: Long = System.currentTimeMillis())
+ 
+diff --git a/app/src/main/java/com/cadastroocr/app/sync/SupabaseApiService.kt b/app/src/main/java/com/cadastroocr/app/sync/SupabaseApiService.kt
+index cdd9a3c..0c8b5fd 100644
+--- a/app/src/main/java/com/cadastroocr/app/sync/SupabaseApiService.kt
++++ b/app/src/main/java/com/cadastroocr/app/sync/SupabaseApiService.kt
+@@ -5,6 +5,7 @@ import com.cadastroocr.app.data.Cliente
+ import com.cadastroocr.app.data.SyncStatus
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
++import okhttp3.HttpUrl.Companion.toHttpUrl
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+@@ -13,6 +14,27 @@ import org.json.JSONArray
+ import org.json.JSONObject
+ import java.util.concurrent.TimeUnit
+ 
++/** Erro HTTP devolvido pelo Supabase (permite distinguir 401 = token expirado de falha de rede). */
++class ApiHttpException(val codigo: Int, mensagem: String) : Exception(mensagem)
++
++/** Sessão devolvida pelo Supabase Auth. [expiraEmMs] é a hora (do celular) em que o access token expira. */
++data class Sessao(
++    val accessToken: String,
++    val refreshToken: String,
++    val email: String,
++    val expiraEmMs: Long
++)
++
++/**
++ * Uma página do pull. [ultimoUpdatedAt] é o `updated_at` (relógio do SERVIDOR) da última linha
++ * recebida e serve de cursor para a próxima sincronização.
++ */
++data class PaginaClientes(
++    val clientes: List<Cliente>,
++    val ultimoUpdatedAt: String?,
++    val cheia: Boolean
++)
++
+ /**
+  * Cliente HTTP direto e leve para a API do Supabase (REST e Auth),
+  * utilizando OkHttp. Não necessita de SDKs externos pesados.
+@@ -21,130 +43,135 @@ class SupabaseApiService {
+ 
+     private val client = OkHttpClient.Builder()
+         .connectTimeout(15, TimeUnit.SECONDS)
+-        .readTimeout(15, TimeUnit.SECONDS)
+-        .writeTimeout(15, TimeUnit.SECONDS)
++        .readTimeout(20, TimeUnit.SECONDS)
++        .writeTimeout(20, TimeUnit.SECONDS)
+         .build()
+ 
+     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+ 
+     private fun getBaseUrl(): String = AuthConfig.SUPABASE_URL.trimEnd('/')
+ 
+-    /**
+-     * Realiza login no Supabase GoTrue Auth via email e senha.
+-     * Retorna Triple(accessToken, refreshToken, userEmail) em caso de sucesso.
+-     */
+-    suspend fun login(email: String, password: String): Result<Triple<String, String, String>> = withContext(Dispatchers.IO) {
+-        if (!AuthConfig.configurado()) {
+-            return@withContext Result.failure(Exception("Supabase ainda não configurado em AuthConfig.kt"))
+-        }
++    private fun mensagemDeErro(corpo: String, codigo: Int, padrao: String): String {
++        val json = try { JSONObject(corpo) } catch (e: Exception) { null }
++        val msg = json?.let {
++            it.optString("error_description", "")
++                .ifBlank { it.optString("msg", "") }
++                .ifBlank { it.optString("message", "") }
++        }.orEmpty()
++        return if (msg.isNotBlank()) msg else "$padrao (código $codigo)"
++    }
+ 
+-        try {
+-            val url = "${getBaseUrl()}/auth/v1/token?grant_type=password"
+-            val bodyObj = JSONObject().apply {
+-                put("email", email.trim())
+-                put("password", password)
+-            }
++    private fun parseSessao(json: JSONObject, emailPadrao: String): Sessao {
++        val expiresIn = json.optLong("expires_in", 3600L)
++        val email = json.optJSONObject("user")?.optString("email", emailPadrao) ?: emailPadrao
++        return Sessao(
++            accessToken = json.optString("access_token", ""),
++            refreshToken = json.optString("refresh_token", ""),
++            email = email,
++            expiraEmMs = System.currentTimeMillis() + expiresIn * 1000L
++        )
++    }
++
++    private fun postAuth(url: String, corpo: JSONObject, emailPadrao: String, padraoErro: String): Result<Sessao> {
++        return try {
+             val request = Request.Builder()
+                 .url(url)
+                 .addHeader("apikey", AuthConfig.SUPABASE_ANON_KEY)
+                 .addHeader("Content-Type", "application/json")
+-                .post(bodyObj.toString().toRequestBody(jsonMediaType))
++                .post(corpo.toString().toRequestBody(jsonMediaType))
+                 .build()
+-
+-            val response = client.newCall(request).execute()
+-            val responseBody = response.body?.string().orEmpty()
+-
+-            if (response.isSuccessful) {
+-                val json = JSONObject(responseBody)
+-                val accessToken = json.getString("access_token")
+-                val refreshToken = json.optString("refresh_token", "")
+-                val userObj = json.optJSONObject("user")
+-                val userEmail = userObj?.optString("email", email) ?: email
+-                Result.success(Triple(accessToken, refreshToken, userEmail))
+-            } else {
+-                val json = try { JSONObject(responseBody) } catch (e: Exception) { null }
+-                val msg = json?.optString("error_description", "")?.ifBlank { json.optString("msg", "") }
+-                    ?: "Falha na autenticação (Código ${response.code})"
+-                Result.failure(Exception(msg))
++            client.newCall(request).execute().use { response ->
++                val texto = response.body?.string().orEmpty()
++                if (response.isSuccessful) {
++                    Result.success(parseSessao(JSONObject(texto), emailPadrao))
++                } else {
++                    Result.failure(ApiHttpException(response.code, mensagemDeErro(texto, response.code, padraoErro)))
++                }
+             }
+         } catch (e: Exception) {
+             Result.failure(e)
+         }
+     }
+ 
+-    /**
+-     * Cadastra um novo usuário no Supabase.
+-     */
+-    suspend fun cadastrar(email: String, password: String): Result<Triple<String, String, String>> = withContext(Dispatchers.IO) {
++    /** Login por e-mail e senha (GoTrue). */
++    suspend fun login(email: String, password: String): Result<Sessao> = withContext(Dispatchers.IO) {
+         if (!AuthConfig.configurado()) {
+             return@withContext Result.failure(Exception("Supabase ainda não configurado em AuthConfig.kt"))
+         }
++        val corpo = JSONObject().apply {
++            put("email", email.trim())
++            put("password", password)
++        }
++        postAuth("${getBaseUrl()}/auth/v1/token?grant_type=password", corpo, email, "Falha na autenticação")
++            .mapCatching { if (it.accessToken.isBlank()) error("Resposta de login sem token") else it }
++    }
+ 
+-        try {
+-            val url = "${getBaseUrl()}/auth/v1/signup"
+-            val bodyObj = JSONObject().apply {
+-                put("email", email.trim())
+-                put("password", password)
+-            }
+-            val request = Request.Builder()
+-                .url(url)
+-                .addHeader("apikey", AuthConfig.SUPABASE_ANON_KEY)
+-                .addHeader("Content-Type", "application/json")
+-                .post(bodyObj.toString().toRequestBody(jsonMediaType))
+-                .build()
+-
+-            val response = client.newCall(request).execute()
+-            val responseBody = response.body?.string().orEmpty()
++    /** Cadastra um novo usuário (só funciona se o signup estiver habilitado no painel do Supabase). */
++    suspend fun cadastrar(email: String, password: String): Result<Sessao> = withContext(Dispatchers.IO) {
++        if (!AuthConfig.configurado()) {
++            return@withContext Result.failure(Exception("Supabase ainda não configurado em AuthConfig.kt"))
++        }
++        val corpo = JSONObject().apply {
++            put("email", email.trim())
++            put("password", password)
++        }
++        postAuth("${getBaseUrl()}/auth/v1/signup", corpo, email, "Falha no cadastro")
++    }
+ 
+-            if (response.isSuccessful) {
+-                val json = JSONObject(responseBody)
+-                val accessToken = json.optString("access_token", "")
+-                val refreshToken = json.optString("refresh_token", "")
+-                val userObj = json.optJSONObject("user")
+-                val userEmail = userObj?.optString("email", email) ?: email
+-                Result.success(Triple(accessToken, refreshToken, userEmail))
+-            } else {
+-                val json = try { JSONObject(responseBody) } catch (e: Exception) { null }
+-                val msg = json?.optString("msg", "")?.ifBlank { json.optString("error_description", "") }
+-                    ?: "Falha no cadastro (Código ${response.code})"
+-                Result.failure(Exception(msg))
+-            }
+-        } catch (e: Exception) {
+-            Result.failure(e)
++    /** Troca o refresh token por um novo par de tokens. */
++    suspend fun renovarToken(refreshToken: String): Result<Sessao> = withContext(Dispatchers.IO) {
++        if (!AuthConfig.configurado()) {
++            return@withContext Result.failure(Exception("Supabase ainda não configurado em AuthConfig.kt"))
+         }
++        val corpo = JSONObject().apply { put("refresh_token", refreshToken) }
++        postAuth("${getBaseUrl()}/auth/v1/token?grant_type=refresh_token", corpo, "", "Falha ao renovar a sessão")
++            .mapCatching { if (it.accessToken.isBlank()) error("Resposta de renovação sem token") else it }
+     }
+ 
+     /**
+-     * Busca todos os clientes atualizados desde o timestamp informado (Pull incremental).
++     * Pull incremental paginado. Filtra pelo `updated_at` do SERVIDOR (não pelo relógio do celular),
++     * incluindo registros apagados (is_deleted = true) para que a exclusão chegue aos outros aparelhos.
++     * [desde] é o cursor guardado (inclusivo: um registro de borda pode vir de novo, o que é inofensivo).
+      */
+-    suspend fun buscarClientesModificados(accessToken: String, desdeTimestamp: Long): Result<List<Cliente>> = withContext(Dispatchers.IO) {
++    suspend fun buscarClientesModificados(
++        accessToken: String,
++        desde: String?,
++        offset: Int
++    ): Result<PaginaClientes> = withContext(Dispatchers.IO) {
+         if (!AuthConfig.configurado()) {
+-            return@withContext Result.success(emptyList())
++            return@withContext Result.success(PaginaClientes(emptyList(), null, false))
+         }
+-
+         try {
+-            val url = "${getBaseUrl()}/rest/v1/clientes?atualizado_em=gte.$desdeTimestamp&order=atualizado_em.asc"
++            val builder = "${getBaseUrl()}/rest/v1/clientes".toHttpUrl().newBuilder()
++            if (!desde.isNullOrBlank()) builder.addQueryParameter("updated_at", "gte.$desde")
++            builder.addQueryParameter("order", "updated_at.asc,id.asc")
++            builder.addQueryParameter("limit", LIMITE_PAGINA.toString())
++            builder.addQueryParameter("offset", offset.toString())
++
+             val request = Request.Builder()
+-                .url(url)
++                .url(builder.build())
+                 .addHeader("apikey", AuthConfig.SUPABASE_ANON_KEY)
+                 .addHeader("Authorization", "Bearer $accessToken")
+                 .addHeader("Accept", "application/json")
+                 .get()
+                 .build()
+ 
+-            val response = client.newCall(request).execute()
+-            val responseBody = response.body?.string().orEmpty()
+-
+-            if (response.isSuccessful) {
+-                val jsonArray = JSONArray(responseBody)
+-                val lista = mutableListOf<Cliente>()
+-                for (i in 0 until jsonArray.length()) {
+-                    val obj = jsonArray.getJSONObject(i)
++            client.newCall(request).execute().use { response ->
++                val texto = response.body?.string().orEmpty()
++                if (!response.isSuccessful) {
++                    return@withContext Result.failure(
++                        ApiHttpException(response.code, mensagemDeErro(texto, response.code, "Erro ao buscar clientes da nuvem"))
++                    )
++                }
++                val array = JSONArray(texto)
++                val lista = ArrayList<Cliente>(array.length())
++                var ultimo: String? = null
++                for (i in 0 until array.length()) {
++                    val obj = array.getJSONObject(i)
+                     lista.add(parseClienteJson(obj))
++                    obj.optString("updated_at", "").takeIf { it.isNotBlank() }?.let { ultimo = it }
+                 }
+-                Result.success(lista)
+-            } else {
+-                Result.failure(Exception("Erro ao buscar clientes da nuvem: ${response.code}"))
++                Result.success(PaginaClientes(lista, ultimo, array.length() >= LIMITE_PAGINA))
+             }
+         } catch (e: Exception) {
+             Result.failure(e)
+@@ -152,31 +179,39 @@ class SupabaseApiService {
+     }
+ 
+     /**
+-     * Envia cliente para o Supabase (Upsert via POST com resolução de duplicatas por ID/UUID).
++     * Envia (upsert por id/uuid) e só considera sucesso se o servidor DEVOLVER a linha gravada.
++     * Assim "enviado" significa "confirmado pelo banco", e não apenas "a requisição saiu".
+      */
+     suspend fun upsertCliente(accessToken: String, cliente: Cliente): Result<Unit> = withContext(Dispatchers.IO) {
+         if (!AuthConfig.configurado()) {
+             return@withContext Result.success(Unit)
+         }
+-
+         try {
+-            val url = "${getBaseUrl()}/rest/v1/clientes"
+-            val bodyJson = clienteToJson(cliente).toString()
++            val url = "${getBaseUrl()}/rest/v1/clientes?on_conflict=id"
+             val request = Request.Builder()
+                 .url(url)
+                 .addHeader("apikey", AuthConfig.SUPABASE_ANON_KEY)
+                 .addHeader("Authorization", "Bearer $accessToken")
+                 .addHeader("Content-Type", "application/json")
+-                .addHeader("Prefer", "resolution=merge-duplicates")
+-                .post(bodyJson.toRequestBody(jsonMediaType))
++                .addHeader("Prefer", "resolution=merge-duplicates,return=representation")
++                .post(clienteToJson(cliente).toString().toRequestBody(jsonMediaType))
+                 .build()
+ 
+-            val response = client.newCall(request).execute()
+-            if (response.isSuccessful) {
+-                Result.success(Unit)
+-            } else {
+-                val erro = response.body?.string().orEmpty()
+-                Result.failure(Exception("Erro ao enviar cliente: ${response.code} - $erro"))
++            client.newCall(request).execute().use { response ->
++                val texto = response.body?.string().orEmpty()
++                if (!response.isSuccessful) {
++                    return@withContext Result.failure(
++                        ApiHttpException(response.code, mensagemDeErro(texto, response.code, "Erro ao enviar cliente"))
++                    )
++                }
++                val confirmado = try {
++                    val arr = JSONArray(texto)
++                    arr.length() >= 1 && arr.getJSONObject(0).optString("id") == cliente.uuid
++                } catch (e: Exception) {
++                    false
++                }
++                if (confirmado) Result.success(Unit)
++                else Result.failure(Exception("O servidor não confirmou a gravação do cliente"))
+             }
+         } catch (e: Exception) {
+             Result.failure(e)
+@@ -184,27 +219,36 @@ class SupabaseApiService {
+     }
+ 
+     /**
+-     * Exclui cliente definitivamente no Supabase ou marca como deletado.
++     * Exclusão LÓGICA (is_deleted = true). Um DELETE físico faria o registro sumir do servidor sem
++     * deixar rastro, e os outros aparelhos nunca ficariam sabendo da exclusão.
++     * Se a linha não existir mais no servidor, a chamada retorna 2xx sem linhas — também é sucesso.
+      */
+-    suspend fun excluirCliente(accessToken: String, uuid: String): Result<Unit> = withContext(Dispatchers.IO) {
++    suspend fun excluirCliente(accessToken: String, uuid: String, atualizadoEm: Long): Result<Unit> = withContext(Dispatchers.IO) {
+         if (!AuthConfig.configurado()) {
+             return@withContext Result.success(Unit)
+         }
+-
+         try {
+             val url = "${getBaseUrl()}/rest/v1/clientes?id=eq.$uuid"
++            val corpo = JSONObject().apply {
++                put("is_deleted", true)
++                put("atualizado_em", atualizadoEm)
++            }
+             val request = Request.Builder()
+                 .url(url)
+                 .addHeader("apikey", AuthConfig.SUPABASE_ANON_KEY)
+                 .addHeader("Authorization", "Bearer $accessToken")
+-                .delete()
++                .addHeader("Content-Type", "application/json")
++                .addHeader("Prefer", "return=minimal")
++                .patch(corpo.toString().toRequestBody(jsonMediaType))
+                 .build()
+ 
+-            val response = client.newCall(request).execute()
+-            if (response.isSuccessful) {
+-                Result.success(Unit)
+-            } else {
+-                Result.failure(Exception("Erro ao excluir cliente: ${response.code}"))
++            client.newCall(request).execute().use { response ->
++                if (response.isSuccessful) {
++                    Result.success(Unit)
++                } else {
++                    val texto = response.body?.string().orEmpty()
++                    Result.failure(ApiHttpException(response.code, mensagemDeErro(texto, response.code, "Erro ao excluir cliente")))
++                }
+             }
+         } catch (e: Exception) {
+             Result.failure(e)
+@@ -242,7 +286,7 @@ class SupabaseApiService {
+     private fun parseClienteJson(obj: JSONObject): Cliente {
+         fun s(key: String) = obj.optString(key, "").trim()
+         return Cliente(
+-            id = 0L, // Room autogenerates local id or keeps existing
++            id = 0L, // o Room gera o id local (ou o SyncManager reaproveita o existente)
+             uuid = obj.optString("id", s("uuid")),
+             nomeCompleto = s("nome_completo"),
+             cpf = s("cpf"),
+@@ -265,9 +309,13 @@ class SupabaseApiService {
+             diaVencimento = s("dia_vencimento"),
+             isDeleted = obj.optBoolean("is_deleted", false),
+             syncStatus = SyncStatus.SYNCED,
+-            lastSyncedAt = System.currentTimeMillis(),
++            lastSyncedAt = 0L,
+             criadoEm = obj.optLong("criado_em", System.currentTimeMillis()),
+             atualizadoEm = obj.optLong("atualizado_em", System.currentTimeMillis())
+         )
+     }
++
++    companion object {
++        const val LIMITE_PAGINA = 500
++    }
+ }
+diff --git a/app/src/main/java/com/cadastroocr/app/sync/SyncManager.kt b/app/src/main/java/com/cadastroocr/app/sync/SyncManager.kt
+index 27fe8f5..99c52db 100644
+--- a/app/src/main/java/com/cadastroocr/app/sync/SyncManager.kt
++++ b/app/src/main/java/com/cadastroocr/app/sync/SyncManager.kt
+@@ -11,14 +11,19 @@ import com.cadastroocr.app.auth.EstadoAuth
+ import com.cadastroocr.app.data.Cliente
+ import com.cadastroocr.app.data.ClienteDao
+ import com.cadastroocr.app.data.SyncStatus
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.withContext
++import java.io.IOException
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+ sealed class EstadoSincronizacao {
+     data object Sincronizado : EstadoSincronizacao()
+@@ -29,18 +34,34 @@ sealed class EstadoSincronizacao {
+     data class Erro(val motivo: String) : EstadoSincronizacao()
+ }
+ 
++/**
++ * Sincronização local-first entre o Room (celular) e o Supabase.
++ *
++ * Ciclo: PULL (baixa o que mudou na nuvem) -> PUSH (envia a fila pendente) -> PULL de confirmação.
++ *
++ * Pontos-chave:
++ *  - O cursor do pull é o `updated_at` do SERVIDOR (guardado em SharedPreferences). Ele não depende do
++ *    relógio do celular nem de quando este aparelho enviou algo, então nenhum cadastro novo é "pulado".
++ *  - "Sincronizado" só aparece se pull e push deram certo; falhas viram estado de Erro/Offline + retry.
++ *  - O push só conta como feito se o servidor devolver a linha gravada.
++ *  - Exclusões são lógicas (is_deleted) e chegam aos outros aparelhos pelo pull.
++ */
+ class SyncManager(
+     private val context: Context,
+     private val dao: ClienteDao,
+     private val apiService: SupabaseApiService,
+     private val authManager: AuthManager
+ ) {
+-    private val scope = CoroutineScope(Dispatchers.IO + Job())
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val prefs = context.getSharedPreferences("cadastro_ocr_sync", Context.MODE_PRIVATE)
+ 
+     private val _estadoSincronizacao = MutableStateFlow<EstadoSincronizacao>(EstadoSincronizacao.Sincronizado)
+     val estadoSincronizacao: StateFlow<EstadoSincronizacao> = _estadoSincronizacao.asStateFlow()
+ 
+-    private var estaSincronizando = false
++    private val mutex = Mutex()
++    @Volatile private var repetirCiclo = false
++    @Volatile private var tentativasFalhas = 0
++    private val retryAgendado = AtomicBoolean(false)
+ 
+     init {
+         registrarMonitorRede()
+@@ -50,18 +71,17 @@ class SyncManager(
+         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+         val request = NetworkRequest.Builder()
+             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
++            .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+             .build()
+ 
+         cm.registerNetworkCallback(request, object : ConnectivityManager.NetworkCallback() {
+             override fun onAvailable(network: Network) {
+-                // Ao recuperar internet, dispara sincronização automática das alterações pendentes
+-                scope.launch {
+-                    sincronizar()
+-                }
++                // Internet voltou: sincroniza o que ficou pendente.
++                scope.launch { sincronizar() }
+             }
+ 
+             override fun onLost(network: Network) {
+-                _estadoSincronizacao.value = EstadoSincronizacao.Offline
++                if (!temInternet()) _estadoSincronizacao.value = EstadoSincronizacao.Offline
+             }
+         })
+     }
+@@ -73,91 +93,197 @@ class SyncManager(
+         return cap.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+     }
+ 
+-    suspend fun sincronizar(): Result<Unit> = withContext(Dispatchers.IO) {
+-        if (estaSincronizando) return@withContext Result.success(Unit)
++    /** Esquece o cursor: a próxima sincronização baixa tudo de novo (usado em login/logout). */
++    fun resetarCursor() {
++        prefs.edit().remove(KEY_CURSOR).apply()
++    }
+ 
+-        if (!AuthConfig.configurado() || authManager.estadoAuth.value is EstadoAuth.ModoOffline) {
+-            _estadoSincronizacao.value = EstadoSincronizacao.ModoLocal
++    /**
++     * Sincroniza ao abrir o app e depois a cada [intervaloMs] enquanto o app estiver visível.
++     * Chamar dentro de `repeatOnLifecycle(STARTED)`: para sozinho quando o app vai para segundo plano.
++     */
++    suspend fun executarEnquantoAtivo(intervaloMs: Long = INTERVALO_PADRAO_MS) {
++        while (true) {
++            sincronizar()
++            delay(intervaloMs)
++        }
++    }
++
++    suspend fun sincronizar(): Result<Unit> = withContext(Dispatchers.IO) {
++        // Já existe um ciclo rodando: pede para ele repetir ao terminar (pega o que acabou de ser salvo).
++        if (!mutex.tryLock()) {
++            repetirCiclo = true
+             return@withContext Result.success(Unit)
+         }
++        try {
++            var resultado: Result<Unit>
++            do {
++                repetirCiclo = false
++                resultado = executarCiclo()
++            } while (repetirCiclo && resultado.isSuccess)
++            resultado
++        } finally {
++            mutex.unlock()
++        }
++    }
+ 
++    private suspend fun executarCiclo(): Result<Unit> {
++        val auth = authManager.estadoAuth.value
++        if (!AuthConfig.configurado() || auth is EstadoAuth.ModoOffline) {
++            _estadoSincronizacao.value = EstadoSincronizacao.ModoLocal
++            return Result.success(Unit)
++        }
++        if (auth is EstadoAuth.Desconectado) {
++            _estadoSincronizacao.value = EstadoSincronizacao.Erro("Sessão expirada. Entre novamente.")
++            return Result.failure(Exception("Usuário não autenticado"))
++        }
+         if (!temInternet()) {
+             _estadoSincronizacao.value = EstadoSincronizacao.Offline
+-            return@withContext Result.failure(Exception("Sem conexão com a internet"))
+-        }
+-
+-        val token = authManager.obterToken()
+-        if (token.isNullOrBlank()) {
+-            _estadoSincronizacao.value = EstadoSincronizacao.Erro("Usuário não autenticado")
+-            return@withContext Result.failure(Exception("Usuário não autenticado"))
++            agendarRetry()
++            return Result.failure(Exception("Sem conexão com a internet"))
+         }
+ 
+-        estaSincronizando = true
+-        _estadoSincronizacao.value = EstadoSincronizacao.Sincronizando("Enviando alterações pendentes...")
++        _estadoSincronizacao.value = EstadoSincronizacao.Sincronizando("Sincronizando...")
+ 
++        var primeiroErro: Throwable? = null
+         try {
+-            // 1. FASE DE PUSH: Envia cadastros, edições e exclusões locais pendentes
+-            val pendentes = dao.buscarPendentes()
+-            for (cliente in pendentes) {
+-                when (cliente.syncStatus) {
+-                    SyncStatus.PENDING_DELETE -> {
+-                        val res = apiService.excluirCliente(token, cliente.uuid)
+-                        if (res.isSuccess) {
+-                            dao.excluirFisicoPorUuid(cliente.uuid)
+-                        }
+-                    }
+-                    SyncStatus.PENDING_INSERT, SyncStatus.PENDING_UPDATE -> {
+-                        val res = apiService.upsertCliente(token, cliente)
+-                        if (res.isSuccess) {
+-                            dao.atualizarStatusSincronizacao(cliente.id, SyncStatus.SYNCED, System.currentTimeMillis())
+-                        }
+-                    }
+-                }
++            // 1) PULL: traz o que mudou na nuvem (novos, edições e exclusões de outros aparelhos).
++            puxarDaNuvem().exceptionOrNull()?.let { if (primeiroErro == null) primeiroErro = it }
++
++            // 2) PUSH: envia a fila persistente (os pendentes ficam no Room até o servidor confirmar).
++            var enviados = 0
++            for (cliente in dao.buscarPendentes()) {
++                val r = enviar(cliente)
++                if (r.isSuccess) enviados++ else if (primeiroErro == null) primeiroErro = r.exceptionOrNull()
+             }
+ 
+-            // 2. FASE DE PULL: Baixa novos clientes e atualizações da nuvem
+-            _estadoSincronizacao.value = EstadoSincronizacao.Sincronizando("Buscando atualizações da nuvem...")
+-            val ultimoSync = dao.obterUltimoTimestampSincronizacao() ?: 0L
+-            // Busca alterações dos últimos 30 dias se for primeiro sync, ou a partir do último sync
+-            val pontoDeBusca = if (ultimoSync > 0L) ultimoSync - 5000L else 0L
+-
+-            val resultadoPull = apiService.buscarClientesModificados(token, pontoDeBusca)
+-            if (resultadoPull.isSuccess) {
+-                val clientesRemotos = resultadoPull.getOrThrow()
+-                for (remoto in clientesRemotos) {
+-                    val local = dao.buscarPorUuid(remoto.uuid)
+-
+-                    if (remoto.isDeleted) {
+-                        if (local != null) {
+-                            dao.excluirFisicoPorUuid(remoto.uuid)
+-                        }
+-                        continue
+-                    }
+-
+-                    if (local == null) {
+-                        // Novo cliente criado no PC ou em outro celular -> salva no Room
+-                        dao.inserir(remoto.copy(id = 0, syncStatus = SyncStatus.SYNCED, lastSyncedAt = System.currentTimeMillis()))
+-                    } else {
+-                        // Cliente já existe localmente: resolve conflitos de campo inteligente
+-                        if (local.syncStatus == SyncStatus.SYNCED || remoto.atualizadoEm >= local.atualizadoEm) {
+-                            val clienteAtualizado = remoto.copy(
+-                                id = local.id,
+-                                syncStatus = SyncStatus.SYNCED,
+-                                lastSyncedAt = System.currentTimeMillis()
+-                            )
+-                            dao.atualizar(clienteAtualizado)
+-                        }
+-                    }
+-                }
++            // 3) PULL de confirmação: consulta real ao servidor depois de enviar.
++            if (enviados > 0) {
++                puxarDaNuvem().exceptionOrNull()?.let { if (primeiroErro == null) primeiroErro = it }
+             }
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            if (primeiroErro == null) primeiroErro = e
++        }
+ 
++        val erro = primeiroErro
++        if (erro == null) {
++            tentativasFalhas = 0
+             _estadoSincronizacao.value = EstadoSincronizacao.Sincronizado
+-            Result.success(Unit)
+-        } catch (e: Exception) {
+-            _estadoSincronizacao.value = EstadoSincronizacao.Erro(e.message ?: "Erro na sincronização")
+-            Result.failure(e)
+-        } finally {
+-            estaSincronizando = false
++            return Result.success(Unit)
++        }
++
++        when {
++            authManager.estadoAuth.value is EstadoAuth.Desconectado ->
++                _estadoSincronizacao.value = EstadoSincronizacao.Erro("Sessão expirada. Entre novamente.")
++            erro is IOException -> {
++                _estadoSincronizacao.value = EstadoSincronizacao.Offline
++                agendarRetry()
++            }
++            else -> {
++                _estadoSincronizacao.value = EstadoSincronizacao.Erro(erro.message ?: "Erro na sincronização")
++                agendarRetry()
++            }
+         }
++        return Result.failure(erro)
++    }
++
++    /** Executa [chamada] com um token válido; se levar 401, renova a sessão e tenta mais uma vez. */
++    private suspend fun <T> comToken(chamada: suspend (String) -> Result<T>): Result<T> {
++        val token = authManager.obterTokenValido().getOrElse { return Result.failure(it) }
++        val resultado = chamada(token)
++        val erro = resultado.exceptionOrNull()
++        if (erro is ApiHttpException && erro.codigo == 401) {
++            val novoToken = authManager.obterTokenValido(tokenRecusado = token).getOrElse { return Result.failure(it) }
++            return chamada(novoToken)
++        }
++        return resultado
++    }
++
++    private suspend fun puxarDaNuvem(): Result<Unit> {
++        val cursorInicial = prefs.getString(KEY_CURSOR, null)
++        var maiorUpdatedAt: String? = cursorInicial
++        var offset = 0
++
++        while (true) {
++            val pagina = comToken { token ->
++                apiService.buscarClientesModificados(token, cursorInicial, offset)
++            }.getOrElse { return Result.failure(it) }
++
++            aplicarRemotos(pagina.clientes)
++            pagina.ultimoUpdatedAt?.let { maiorUpdatedAt = it }
++
++            if (!pagina.cheia) break
++            offset += pagina.clientes.size
++        }
++
++        // O cursor só avança depois que TODAS as páginas foram aplicadas com sucesso.
++        val novoCursor = maiorUpdatedAt
++        if (novoCursor != null && novoCursor != cursorInicial) {
++            prefs.edit().putString(KEY_CURSOR, novoCursor).apply()
++        }
++        return Result.success(Unit)
++    }
++
++    private suspend fun aplicarRemotos(remotos: List<Cliente>) {
++        for (remoto in remotos) {
++            val local = dao.buscarPorUuid(remoto.uuid)
++
++            if (remoto.isDeleted) {
++                // Exclusão feita em outro aparelho/na web: remove daqui também.
++                if (local != null) dao.excluirFisicoPorUuid(remoto.uuid)
++                continue
++            }
++
++            if (local == null) {
++                dao.inserir(remoto.copy(id = 0, syncStatus = SyncStatus.SYNCED))
++                continue
++            }
++
++            // Exclusão local ainda não enviada: não ressuscitar.
++            if (local.syncStatus == SyncStatus.PENDING_DELETE) continue
++
++            // Local sem pendências -> a nuvem manda. Local com edição pendente -> vence a mais recente.
++            if (local.syncStatus == SyncStatus.SYNCED || remoto.atualizadoEm >= local.atualizadoEm) {
++                val novo = remoto.copy(
++                    id = local.id,
++                    syncStatus = SyncStatus.SYNCED,
++                    lastSyncedAt = local.lastSyncedAt
++                )
++                if (novo != local) dao.atualizar(novo) // evita regravar (e redesenhar a lista) sem mudança real
++            }
++        }
++    }
++
++    private suspend fun enviar(cliente: Cliente): Result<Unit> {
++        return if (cliente.syncStatus == SyncStatus.PENDING_DELETE) {
++            comToken { token -> apiService.excluirCliente(token, cliente.uuid, cliente.atualizadoEm) }
++                .onSuccess { dao.excluirFisicoSePendenteDelete(cliente.uuid) }
++        } else {
++            comToken { token -> apiService.upsertCliente(token, cliente) }
++                .onSuccess {
++                    dao.marcarSincronizadoSeInalterado(cliente.id, cliente.atualizadoEm, cliente.syncStatus)
++                }
++        }
++    }
++
++    /** Nova tentativa automática com espera crescente (15 s, 30 s, 60 s... até 5 min). */
++    private fun agendarRetry() {
++        if (!retryAgendado.compareAndSet(false, true)) return
++        val espera = minOf(BASE_RETRY_MS shl minOf(tentativasFalhas, 5), MAX_RETRY_MS)
++        tentativasFalhas++
++        scope.launch {
++            delay(espera)
++            retryAgendado.set(false)
++            sincronizar()
++        }
++    }
++
++    companion object {
++        private const val KEY_CURSOR = "cursor_updated_at"
++        private const val INTERVALO_PADRAO_MS = 20_000L
++        private const val BASE_RETRY_MS = 15_000L
++        private const val MAX_RETRY_MS = 300_000L
+     }
+ }
+diff --git a/app/src/main/java/com/cadastroocr/app/ui/screens/ClientListScreen.kt b/app/src/main/java/com/cadastroocr/app/ui/screens/ClientListScreen.kt
+index 4ce7c57..a937712 100644
+--- a/app/src/main/java/com/cadastroocr/app/ui/screens/ClientListScreen.kt
++++ b/app/src/main/java/com/cadastroocr/app/ui/screens/ClientListScreen.kt
+@@ -7,11 +7,13 @@ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Add
++import androidx.compose.material.icons.filled.Check
+ import androidx.compose.material.icons.filled.CloudDone
+ import androidx.compose.material.icons.filled.CloudOff
+ import androidx.compose.material.icons.filled.Logout
+ import androidx.compose.material.icons.filled.Refresh
+ import androidx.compose.material.icons.filled.Search
++import androidx.compose.material.icons.filled.Sort
+ import androidx.compose.material.icons.filled.Sync
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
+@@ -36,6 +38,7 @@ import com.cadastroocr.app.ui.theme.SurfaceDark
+ import com.cadastroocr.app.ui.theme.TextMuted
+ import com.cadastroocr.app.ui.theme.TextSecondary
+ import com.cadastroocr.app.viewmodel.ClienteViewModel
++import com.cadastroocr.app.viewmodel.OrdemClientes
+ 
+ @Composable
+ fun ClientListScreen(
+@@ -50,7 +53,15 @@ fun ClientListScreen(
+     val estadoAuth by viewModel.estadoAuth.collectAsStateWithLifecycle()
+     val qtdPendentes by viewModel.quantidadePendentes.collectAsStateWithLifecycle()
+ 
++    val ordem by viewModel.ordem.collectAsStateWithLifecycle()
++
+     var mostrarDialogoLogout by remember { mutableStateOf(false) }
++    var mostrarMenuOrdem by remember { mutableStateOf(false) }
++
++    // Se a sessão acabar de verdade (refresh token recusado) ou o usuário sair, volta para o login.
++    LaunchedEffect(estadoAuth) {
++        if (estadoAuth is EstadoAuth.Desconectado) onLogout()
++    }
+ 
+     Scaffold(
+         floatingActionButton = {
+@@ -150,7 +161,14 @@ fun ClientListScreen(
+                             is EstadoSincronizacao.Erro -> {
+                                 Icon(Icons.Filled.CloudOff, contentDescription = null, tint = DangerRed, modifier = Modifier.size(18.dp))
+                                 Spacer(Modifier.width(8.dp))
+-                                Text("Erro ao sincronizar", color = DangerRed, style = MaterialTheme.typography.labelMedium)
++                                Text(
++                                    "Erro: ${(estadoSync as EstadoSincronizacao.Erro).motivo}",
++                                    color = DangerRed,
++                                    style = MaterialTheme.typography.labelMedium,
++                                    maxLines = 1,
++                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
++                                    modifier = Modifier.widthIn(max = 220.dp)
++                                )
+                             }
+                             else -> {}
+                         }
+@@ -174,15 +192,45 @@ fun ClientListScreen(
+ 
+             Spacer(Modifier.height(14.dp))
+ 
+-            OutlinedTextField(
+-                value = termoBusca,
+-                onValueChange = viewModel::atualizarBusca,
+-                placeholder = { Text("Buscar por nome, CPF, e-mail ou telefone...") },
+-                leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+-                singleLine = true,
+-                shape = RoundedCornerShape(14.dp),
+-                modifier = Modifier.fillMaxWidth()
+-            )
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                verticalAlignment = Alignment.CenterVertically
++            ) {
++                OutlinedTextField(
++                    value = termoBusca,
++                    onValueChange = viewModel::atualizarBusca,
++                    placeholder = { Text("Buscar por nome, CPF, e-mail ou telefone...") },
++                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
++                    singleLine = true,
++                    shape = RoundedCornerShape(14.dp),
++                    modifier = Modifier.weight(1f)
++                )
++
++                Box {
++                    IconButton(onClick = { mostrarMenuOrdem = true }) {
++                        Icon(Icons.Filled.Sort, contentDescription = "Ordenar", tint = AccentGreen)
++                    }
++                    DropdownMenu(
++                        expanded = mostrarMenuOrdem,
++                        onDismissRequest = { mostrarMenuOrdem = false }
++                    ) {
++                        OrdemClientes.values().forEach { opcao ->
++                            DropdownMenuItem(
++                                text = { Text(opcao.rotulo) },
++                                onClick = {
++                                    viewModel.definirOrdem(opcao)
++                                    mostrarMenuOrdem = false
++                                },
++                                leadingIcon = {
++                                    if (opcao == ordem) {
++                                        Icon(Icons.Filled.Check, contentDescription = null, tint = AccentGreen)
++                                    }
++                                }
++                            )
++                        }
++                    }
++                }
++            }
+ 
+             Spacer(Modifier.height(14.dp))
+ 
+@@ -190,6 +238,11 @@ fun ClientListScreen(
+                 "Clientes cadastrados (${clientes.size})",
+                 style = MaterialTheme.typography.titleMedium
+             )
++            Text(
++                "Ordem: ${ordem.rotulo}",
++                style = MaterialTheme.typography.labelSmall,
++                color = TextMuted
++            )
+ 
+             Spacer(Modifier.height(8.dp))
+ 
+@@ -223,8 +276,7 @@ fun ClientListScreen(
+                 TextButton(
+                     onClick = {
+                         mostrarDialogoLogout = false
+-                        viewModel.logout()
+-                        onLogout()
++                        viewModel.logout() // o LaunchedEffect(estadoAuth) leva ao login
+                     }
+                 ) {
+                     Text("Sair", color = DangerRed)
+diff --git a/app/src/main/java/com/cadastroocr/app/viewmodel/ClienteViewModel.kt b/app/src/main/java/com/cadastroocr/app/viewmodel/ClienteViewModel.kt
+index a05934f..c129f65 100644
+--- a/app/src/main/java/com/cadastroocr/app/viewmodel/ClienteViewModel.kt
++++ b/app/src/main/java/com/cadastroocr/app/viewmodel/ClienteViewModel.kt
+@@ -17,10 +17,13 @@ import com.cadastroocr.app.ocr.DocumentDataParser
+ import com.cadastroocr.app.ocr.DocumentImageStore
+ import com.cadastroocr.app.ocr.NivelReconhecimento
+ import com.cadastroocr.app.ocr.OcrAnalyzer
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.flatMapLatest
++import kotlinx.coroutines.flow.flowOn
+ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+@@ -55,6 +58,7 @@ class ClienteViewModel(
+         viewModelScope.launch {
+             val resultado = authManager.login(email, senha)
+             if (resultado.isSuccess) {
++                repository.syncManager.resetarCursor()
+                 repository.sincronizarAgora()
+             }
+             aoConcluir(resultado)
+@@ -65,6 +69,7 @@ class ClienteViewModel(
+         viewModelScope.launch {
+             val resultado = authManager.cadastrar(email, senha)
+             if (resultado.isSuccess) {
++                repository.syncManager.resetarCursor()
+                 repository.sincronizarAgora()
+             }
+             aoConcluir(resultado)
+@@ -77,6 +82,7 @@ class ClienteViewModel(
+ 
+     fun logout() {
+         authManager.logout()
++        repository.syncManager.resetarCursor()
+     }
+ 
+     /**
+@@ -93,8 +99,20 @@ class ClienteViewModel(
+     private val _termoBusca = MutableStateFlow("")
+     val termoBusca: StateFlow<String> = _termoBusca
+ 
+-    val clientes: StateFlow<List<Cliente>> = _termoBusca
+-        .flatMapLatest { termo -> repository.observarClientes(termo) }
++    private val _ordem = MutableStateFlow(OrdemClientes.NOME_AZ)
++    val ordem: StateFlow<OrdemClientes> = _ordem
++
++    fun definirOrdem(ordem: OrdemClientes) {
++        _ordem.value = ordem
++    }
++
++    // Busca (no banco) + ordenação (só na apresentação), sobre TODOS os registros locais,
++    // inclusive os que vieram da nuvem.
++    val clientes: StateFlow<List<Cliente>> = combine(
++        _termoBusca.flatMapLatest { termo -> repository.observarClientes(termo) },
++        _ordem
++    ) { lista, ordem -> ordenarClientes(lista, ordem) }
++        .flowOn(Dispatchers.Default)
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+ 
+     private val _estadoOcr = MutableStateFlow<EstadoOcr>(EstadoOcr.Ocioso)
+diff --git a/app/src/main/java/com/cadastroocr/app/viewmodel/OrdemClientes.kt b/app/src/main/java/com/cadastroocr/app/viewmodel/OrdemClientes.kt
+new file mode 100644
+index 0000000..c87b745
+--- /dev/null
++++ b/app/src/main/java/com/cadastroocr/app/viewmodel/OrdemClientes.kt
+@@ -0,0 +1,33 @@
++package com.cadastroocr.app.viewmodel
++
++import com.cadastroocr.app.data.Cliente
++import java.text.Collator
++import java.util.Locale
++
++/** Formas de ordenar a listagem. Só mudam a apresentação na tela; nada é gravado no banco. */
++enum class OrdemClientes(val rotulo: String) {
++    NOME_AZ("Nome (A–Z)"),
++    NOME_ZA("Nome (Z–A)"),
++    MAIS_RECENTES("Mais recentes adicionados"),
++    MAIS_ANTIGOS("Mais antigos adicionados"),
++    ULTIMOS_ATUALIZADOS("Últimos atualizados")
++}
++
++// PRIMARY: ignora maiúsculas/minúsculas e acentos ("Álvaro" fica junto de "Alvaro").
++private val collatorPtBr: Collator = Collator.getInstance(Locale("pt", "BR")).apply {
++    strength = Collator.PRIMARY
++}
++
++fun ordenarClientes(lista: List<Cliente>, ordem: OrdemClientes): List<Cliente> {
++    val porNome = Comparator<Cliente> { a, b ->
++        val c = collatorPtBr.compare(a.nomeCompleto.trim(), b.nomeCompleto.trim())
++        if (c != 0) c else a.criadoEm.compareTo(b.criadoEm)
++    }
++    return when (ordem) {
++        OrdemClientes.NOME_AZ -> lista.sortedWith(porNome)
++        OrdemClientes.NOME_ZA -> lista.sortedWith(porNome.reversed())
++        OrdemClientes.MAIS_RECENTES -> lista.sortedByDescending { it.criadoEm }
++        OrdemClientes.MAIS_ANTIGOS -> lista.sortedBy { it.criadoEm }
++        OrdemClientes.ULTIMOS_ATUALIZADOS -> lista.sortedByDescending { it.atualizadoEm }
++    }
++}
