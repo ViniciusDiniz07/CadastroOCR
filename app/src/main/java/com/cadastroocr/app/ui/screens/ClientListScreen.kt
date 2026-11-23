@@ -7,11 +7,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -36,6 +38,7 @@ import com.cadastroocr.app.ui.theme.SurfaceDark
 import com.cadastroocr.app.ui.theme.TextMuted
 import com.cadastroocr.app.ui.theme.TextSecondary
 import com.cadastroocr.app.viewmodel.ClienteViewModel
+import com.cadastroocr.app.viewmodel.OrdemClientes
 
 @Composable
 fun ClientListScreen(
@@ -50,7 +53,15 @@ fun ClientListScreen(
     val estadoAuth by viewModel.estadoAuth.collectAsStateWithLifecycle()
     val qtdPendentes by viewModel.quantidadePendentes.collectAsStateWithLifecycle()
 
+    val ordem by viewModel.ordem.collectAsStateWithLifecycle()
+
     var mostrarDialogoLogout by remember { mutableStateOf(false) }
+    var mostrarMenuOrdem by remember { mutableStateOf(false) }
+
+    // Se a sessão acabar de verdade (refresh token recusado) ou o usuário sair, volta para o login.
+    LaunchedEffect(estadoAuth) {
+        if (estadoAuth is EstadoAuth.Desconectado) onLogout()
+    }
 
     Scaffold(
         floatingActionButton = {
@@ -150,7 +161,14 @@ fun ClientListScreen(
                             is EstadoSincronizacao.Erro -> {
                                 Icon(Icons.Filled.CloudOff, contentDescription = null, tint = DangerRed, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text("Erro ao sincronizar", color = DangerRed, style = MaterialTheme.typography.labelMedium)
+                                Text(
+                                    "Erro: ${(estadoSync as EstadoSincronizacao.Erro).motivo}",
+                                    color = DangerRed,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    modifier = Modifier.widthIn(max = 220.dp)
+                                )
                             }
                             else -> {}
                         }
@@ -174,21 +192,56 @@ fun ClientListScreen(
 
             Spacer(Modifier.height(14.dp))
 
-            OutlinedTextField(
-                value = termoBusca,
-                onValueChange = viewModel::atualizarBusca,
-                placeholder = { Text("Buscar por nome, CPF, e-mail ou telefone...") },
-                leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                singleLine = true,
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth()
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = termoBusca,
+                    onValueChange = viewModel::atualizarBusca,
+                    placeholder = { Text("Buscar por nome, CPF, e-mail ou telefone...") },
+                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.weight(1f)
+                )
+
+                Box {
+                    IconButton(onClick = { mostrarMenuOrdem = true }) {
+                        Icon(Icons.Filled.Sort, contentDescription = "Ordenar", tint = AccentGreen)
+                    }
+                    DropdownMenu(
+                        expanded = mostrarMenuOrdem,
+                        onDismissRequest = { mostrarMenuOrdem = false }
+                    ) {
+                        OrdemClientes.values().forEach { opcao ->
+                            DropdownMenuItem(
+                                text = { Text(opcao.rotulo) },
+                                onClick = {
+                                    viewModel.definirOrdem(opcao)
+                                    mostrarMenuOrdem = false
+                                },
+                                leadingIcon = {
+                                    if (opcao == ordem) {
+                                        Icon(Icons.Filled.Check, contentDescription = null, tint = AccentGreen)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
 
             Spacer(Modifier.height(14.dp))
 
             Text(
                 "Clientes cadastrados (${clientes.size})",
                 style = MaterialTheme.typography.titleMedium
+            )
+            Text(
+                "Ordem: ${ordem.rotulo}",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextMuted
             )
 
             Spacer(Modifier.height(8.dp))
@@ -223,8 +276,7 @@ fun ClientListScreen(
                 TextButton(
                     onClick = {
                         mostrarDialogoLogout = false
-                        viewModel.logout()
-                        onLogout()
+                        viewModel.logout() // o LaunchedEffect(estadoAuth) leva ao login
                     }
                 ) {
                     Text("Sair", color = DangerRed)

@@ -17,10 +17,13 @@ import com.cadastroocr.app.ocr.DocumentDataParser
 import com.cadastroocr.app.ocr.DocumentImageStore
 import com.cadastroocr.app.ocr.NivelReconhecimento
 import com.cadastroocr.app.ocr.OcrAnalyzer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -55,6 +58,7 @@ class ClienteViewModel(
         viewModelScope.launch {
             val resultado = authManager.login(email, senha)
             if (resultado.isSuccess) {
+                repository.syncManager.resetarCursor()
                 repository.sincronizarAgora()
             }
             aoConcluir(resultado)
@@ -65,6 +69,7 @@ class ClienteViewModel(
         viewModelScope.launch {
             val resultado = authManager.cadastrar(email, senha)
             if (resultado.isSuccess) {
+                repository.syncManager.resetarCursor()
                 repository.sincronizarAgora()
             }
             aoConcluir(resultado)
@@ -77,6 +82,7 @@ class ClienteViewModel(
 
     fun logout() {
         authManager.logout()
+        repository.syncManager.resetarCursor()
     }
 
     /**
@@ -93,8 +99,20 @@ class ClienteViewModel(
     private val _termoBusca = MutableStateFlow("")
     val termoBusca: StateFlow<String> = _termoBusca
 
-    val clientes: StateFlow<List<Cliente>> = _termoBusca
-        .flatMapLatest { termo -> repository.observarClientes(termo) }
+    private val _ordem = MutableStateFlow(OrdemClientes.NOME_AZ)
+    val ordem: StateFlow<OrdemClientes> = _ordem
+
+    fun definirOrdem(ordem: OrdemClientes) {
+        _ordem.value = ordem
+    }
+
+    // Busca (no banco) + ordenação (só na apresentação), sobre TODOS os registros locais,
+    // inclusive os que vieram da nuvem.
+    val clientes: StateFlow<List<Cliente>> = combine(
+        _termoBusca.flatMapLatest { termo -> repository.observarClientes(termo) },
+        _ordem
+    ) { lista, ordem -> ordenarClientes(lista, ordem) }
+        .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _estadoOcr = MutableStateFlow<EstadoOcr>(EstadoOcr.Ocioso)
