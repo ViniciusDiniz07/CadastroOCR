@@ -51,8 +51,33 @@ interface ClienteDao {
     @Update
     suspend fun atualizar(cliente: Cliente)
 
+    @Query("SELECT COUNT(*) FROM clientes WHERE syncStatus != 'SYNCED'")
+    suspend fun contarPendentes(): Int
+
     @Query("UPDATE clientes SET syncStatus = :status, lastSyncedAt = :syncedAt WHERE id = :id")
     suspend fun atualizarStatusSincronizacao(id: Long, status: String, syncedAt: Long = System.currentTimeMillis())
+
+    /**
+     * Marca como sincronizado SOMENTE se o registro não mudou desde que foi enviado.
+     * Se o usuário editou o cliente durante o envio, ele continua pendente e vai no próximo ciclo
+     * (antes, a edição nova era marcada como SYNCED e nunca subia).
+     */
+    @Query(
+        """
+        UPDATE clientes SET syncStatus = 'SYNCED', lastSyncedAt = :syncedAt
+        WHERE id = :id AND atualizadoEm = :atualizadoEm AND syncStatus = :statusEnviado
+        """
+    )
+    suspend fun marcarSincronizadoSeInalterado(
+        id: Long,
+        atualizadoEm: Long,
+        statusEnviado: String,
+        syncedAt: Long = System.currentTimeMillis()
+    ): Int
+
+    /** Remove o registro local de uma exclusão já confirmada no servidor (só se continuar marcado como exclusão pendente). */
+    @Query("DELETE FROM clientes WHERE uuid = :uuid AND syncStatus = 'PENDING_DELETE'")
+    suspend fun excluirFisicoSePendenteDelete(uuid: String)
 
     @Query("UPDATE clientes SET isDeleted = 1, syncStatus = 'PENDING_DELETE', atualizadoEm = :atualizadoEm WHERE id = :id")
     suspend fun marcarComoExcluido(id: Long, atualizadoEm: Long = System.currentTimeMillis())

@@ -26,11 +26,11 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "cadastro_ocr.db"
                 )
-                    // O schema ainda está sendo ajustado durante o desenvolvimento.
-                    // Isso apaga e recria o banco quando a versão muda, em vez de travar
-                    // com erro. Antes de publicar a versão final para uso real, troque
-                    // isso por uma Migration de verdade para não perder dados dos clientes.
-                    .fallbackToDestructiveMigration()
+                    // Só as versões 1 e 2 (anteriores à sincronização, sem dados valiosos na nuvem)
+                    // podem ser recriadas. A partir da versão 3 NUNCA se apaga o banco: ao mudar o
+                    // schema (aumentar `version`), é obrigatório escrever uma Migration com
+                    // `.addMigrations(...)`, senão o Room recusa abrir em vez de apagar os clientes.
+                    .fallbackToDestructiveMigrationFrom(1, 2)
                     .build()
                 INSTANCE = instance
                 instance
